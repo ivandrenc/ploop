@@ -67,6 +67,15 @@ final class AppModel: ObservableObject {
         // Illness/strain early-warning recomputes when the daily history changes.
         repo.$days.sink { [weak self] days in self?.evaluateIllness(days) }.store(in: &hrCancellables)
 
+        // A QC band computes sleep / HRV / SpO2 itself; rescore and refresh once each history pass lands.
+        ble.onBandHistorySynced = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                await self.intelligence.analyzeRecent()
+                await self.repo.refresh()
+            }
+        }
+
         moments = (UserDefaults.standard.array(forKey: "moments") as? [Double] ?? [])
             .map { Date(timeIntervalSince1970: $0) }
 

@@ -12,6 +12,9 @@ final class Repository: ObservableObject {
     /// streams by IntelligenceEngine). Merged UNDER the imported `deviceId` rows at read time, so a
     /// real WHOOP import always wins and the strap-only user still gets a populated dashboard.
     private var computedDeviceId: String { deviceId + "-noop" }
+    /// Source id for nightly rows a QC Wireless band computed itself (sleep stages, HRV, SpO2).
+    /// Merged between the computed scores and an import.
+    nonisolated static let bandDeviceId = "qc-band"
     private var store: WhoopStore?
 
     /// Daily metrics (recovery/strain/sleep/HRV/RHR…) over the recent window, oldest→newest.
@@ -59,19 +62,24 @@ final class Repository: ObservableObject {
 
         let imported = (try? await store.dailyMetrics(deviceId: deviceId, from: fromDay, to: toDay)) ?? []
         let computed = (try? await store.dailyMetrics(deviceId: computedDeviceId, from: fromDay, to: toDay)) ?? []
+        let band = (try? await store.dailyMetrics(deviceId: Self.bandDeviceId, from: fromDay, to: toDay)) ?? []
         let impSleep = (try? await store.sleepSessions(deviceId: deviceId, from: lo, to: hi, limit: 4000)) ?? []
         let compSleep = (try? await store.sleepSessions(deviceId: computedDeviceId, from: lo, to: hi, limit: 4000)) ?? []
+        let bandSleep = (try? await store.sleepSessions(deviceId: Self.bandDeviceId, from: lo, to: hi, limit: 4000)) ?? []
 
-        self.days = Self.mergeDaily(imported: imported, computed: computed)
-        self.sleeps = Self.mergeSleep(imported: impSleep, computed: compSleep)
+        self.days = Self.mergeDaily(imported: imported, computed: Self.mergeDaily(imported: band, computed: computed))
+        self.sleeps = Self.mergeSleep(imported: impSleep, computed: Self.mergeSleep(imported: bandSleep, computed: compSleep))
         self.loaded = true
     }
 
-    /// Imported daily rows win per day; computed rows fill the days the import doesn't cover.
+    /// Imported daily rows win per day; computed rows fill the days the import doesn't cover, and
+    /// the fields an imported row leaves empty (e.g. band sleep rows carry no strain).
     private static func mergeDaily(imported: [DailyMetric], computed: [DailyMetric]) -> [DailyMetric] {
         var byDay: [String: DailyMetric] = [:]
         for d in computed { byDay[d.day] = d }   // computed first…
-        for d in imported { byDay[d.day] = d }   // …import overwrites, so a real WHOOP import always wins
+        for d in imported {                      // …import overwrites, so a real WHOOP import always wins
+            byDay[d.day] = byDay[d.day].map { d.filling(from: $0) } ?? d
+        }
         return byDay.values.sorted { $0.day < $1.day }
     }
 
@@ -160,4 +168,25 @@ final class Repository: ObservableObject {
     }()
 
     static func dayString(_ d: Date) -> String { dayFormatter.string(from: d) }
+}
+
+private extension DailyMetric {
+    /// This row with its nil fields taken from `other`.
+    func filling(from other: DailyMetric) -> DailyMetric {
+        DailyMetric(day: day,
+                    totalSleepMin: totalSleepMin ?? other.totalSleepMin,
+                    efficiency: efficiency ?? other.efficiency,
+                    deepMin: deepMin ?? other.deepMin,
+                    remMin: remMin ?? other.remMin,
+                    lightMin: lightMin ?? other.lightMin,
+                    disturbances: disturbances ?? other.disturbances,
+                    restingHr: restingHr ?? other.restingHr,
+                    avgHrv: avgHrv ?? other.avgHrv,
+                    recovery: recovery ?? other.recovery,
+                    strain: strain ?? other.strain,
+                    exerciseCount: exerciseCount ?? other.exerciseCount,
+                    spo2Pct: spo2Pct ?? other.spo2Pct,
+                    skinTempDevC: skinTempDevC ?? other.skinTempDevC,
+                    respRateBpm: respRateBpm ?? other.respRateBpm)
+    }
 }

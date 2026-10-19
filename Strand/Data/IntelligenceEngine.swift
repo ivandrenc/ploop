@@ -74,10 +74,27 @@ final class IntelligenceEngine: ObservableObject {
 
             let res = AnalyticsEngine.analyzeDay(day: day, hr: hr, rr: rr, resp: resp, gravity: grav,
                                                  profile: up, baselines: baselines, maxHROverride: maxHR)
-            out.append(Computed(day: day, recovery: res.recovery, strain: res.strain,
-                                sleepMin: res.daily.totalSleepMin, hrv: res.daily.avgHrv,
-                                rhr: res.daily.restingHr))
-            dailies.append(res.daily)
+            // No R-R (e.g. a QC band): score recovery from the HRV / resting HR the band measured
+            // overnight instead, against the same personal baselines.
+            var daily = res.daily
+            if daily.recovery == nil,
+               let band = (try? await store.dailyMetrics(deviceId: Repository.bandDeviceId, from: day, to: day))?.first,
+               let hrv = band.avgHrv, let rhr = band.restingHr,
+               let recovery = RecoveryScorer.recovery(hrv: hrv, rhr: Double(rhr), resp: nil,
+                                                      hrvBaseline: hrvBase, rhrBaseline: rhrBase,
+                                                      respBaseline: nil, sleepPerf: band.efficiency) {
+                daily = DailyMetric(day: daily.day, totalSleepMin: daily.totalSleepMin,
+                                    efficiency: daily.efficiency, deepMin: daily.deepMin,
+                                    remMin: daily.remMin, lightMin: daily.lightMin,
+                                    disturbances: daily.disturbances, restingHr: daily.restingHr,
+                                    avgHrv: daily.avgHrv, recovery: recovery, strain: daily.strain,
+                                    exerciseCount: daily.exerciseCount, spo2Pct: daily.spo2Pct,
+                                    skinTempDevC: daily.skinTempDevC, respRateBpm: daily.respRateBpm)
+            }
+            out.append(Computed(day: day, recovery: daily.recovery, strain: res.strain,
+                                sleepMin: daily.totalSleepMin, hrv: daily.avgHrv,
+                                rhr: daily.restingHr))
+            dailies.append(daily)
             cachedSleep.append(contentsOf: res.cachedSleep)
         }
 

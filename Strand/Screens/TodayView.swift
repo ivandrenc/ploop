@@ -284,7 +284,8 @@ struct TodayView: View {
     /// if the trailing window has <2 points, fall back to ALL history so sparse
     /// series (weight) still render a value + line instead of an empty state.
     private func sparkValues(_ key: String, source: String, window: Int) async -> [Double] {
-        let all = await repo.series(key: key, source: source)   // full history, asc
+        var all = await repo.series(key: key, source: source)   // full history, asc
+        if all.isEmpty { all = await repo.series(key: key, source: Repository.bandDeviceId) }   // QC band
         guard !all.isEmpty else { return [] }
         let windowed = trailingWindow(all, days: window)
         let chosen = windowed.count >= 2 ? windowed : all

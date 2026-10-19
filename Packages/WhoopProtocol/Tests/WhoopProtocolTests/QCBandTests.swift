@@ -30,19 +30,20 @@ final class QCBandTests: XCTestCase {
         XCTAssertEqual(p[15], QCBand.checksum(p))
     }
 
-    func testSetTimeIsBCDInUTC() {
+    func testSetTimeIsBCDInBandTimeZone() {
         let date = Date(timeIntervalSince1970: 1_704_164_645)   // 2024-01-02 03:04:05 UTC
-        XCTAssertEqual(QCBand.setTime(date), Self.hex("01240102030405010000000000000035"))
+        XCTAssertEqual(QCBand.setTime(date, timeZone: TimeZone(identifier: "UTC")!),
+                       Self.hex("01240102030405010000000000000035"))
     }
 
     func testReadHeartRateLogEncodesLittleEndianDayStart() {
-        XCTAssertEqual(QCBand.readHeartRateLog(dayStartUnix: 1_700_006_400),
+        XCTAssertEqual(QCBand.readHeartRateLog(bandDayStart: 1_700_006_400),
                        QCBand.packet(0x15, [0x00, 0x0A, 0x54, 0x65]))
     }
 
-    func testUTCDayStart() {
-        XCTAssertEqual(QCBand.utcDayStart(1_700_006_400), 1_700_006_400)
-        XCTAssertEqual(QCBand.utcDayStart(1_700_006_400 + 86_399), 1_700_006_400)
+    func testBandSecondsAddsZoneOffset() {
+        let ny = TimeZone(identifier: "America/New_York")!
+        XCTAssertEqual(QCBand.bandSeconds(1_700_006_400, timeZone: ny), 1_700_006_400 - 5 * 3_600)
     }
 
     // MARK: - Parsing
@@ -69,7 +70,7 @@ final class QCBandTests: XCTestCase {
     func testParseNotification() {
         // Captured from the H59 band ("st").
         XCTAssertEqual(QCBand.parse(Self.hex("73010000000000000000000000000074")),
-                       .notification(kind: 1))
+                       .notification(kind: 1, data: [UInt8](repeating: 0, count: 13)))
     }
 
     func testParseRejectsBadChecksumAndLength() {
@@ -77,40 +78,76 @@ final class QCBandTests: XCTestCase {
         XCTAssertNil(QCBand.parse([0x03, 0x64, 0x67]))
     }
 
-    // MARK: - Heart-rate log
+    // MARK: - Slot logs
 
     func testHeartRateLogReassembly() throws {
-        let day = 1_700_006_400
-        var parser = QCBand.HeartRateLogParser()
-        let now = day + 86_400
-
+        var parser = QCBand.SlotLogParser(kind: .heartRate)
         // colmi_r02_client example header: 24 packets, 5-minute slots. Use 3 packets here.
-        XCTAssertNil(parser.feed(QCBand.packet(0x15, [0x00, 0x03, 0x05]), now: now))
+        XCTAssertNil(parser.feed(QCBand.packet(0x15, [0x00, 0x03, 0x05])))
         let ts: [UInt8] = [0x00, 0x0A, 0x54, 0x65]
-        XCTAssertNil(parser.feed(QCBand.packet(0x15, [0x01] + ts + [60, 0, 62, 0, 0, 0, 0, 0, 70]), now: now))
-        let last = parser.feed(QCBand.packet(0x15, [0x02, 80] + [UInt8](repeating: 0, count: 12)), now: now)
+        XCTAssertNil(parser.feed(QCBand.packet(0x15, [0x01] + ts + [60, 0, 62, 0, 0, 0, 0, 0, 70])))
+        let last = parser.feed(QCBand.packet(0x15, [0x02, 80] + [UInt8](repeating: 0, count: 12)))
 
         let samples = try XCTUnwrap(last)
-        XCTAssertEqual(samples.map(\.ts), [day, day + 600, day + 2_400, day + 2_700])
-        XCTAssertEqual(samples.map(\.bpm), [60, 62, 70, 80])
+        XCTAssertEqual(samples.map(\.minuteOfDay), [0, 10, 40, 45])
+        XCTAssertEqual(samples.map(\.value), [60, 62, 70, 80])
     }
 
-    func testHeartRateLogDropsFutureSlots() {
-        let day = 1_700_006_400
-        var parser = QCBand.HeartRateLogParser()
-        _ = parser.feed(QCBand.packet(0x15, [0x00, 0x02, 0x05]), now: day + 300)
-        let samples = parser.feed(QCBand.packet(0x15, [0x01, 0x00, 0x0A, 0x54, 0x65, 60, 61, 62]),
-                                  now: day + 300)
-        XCTAssertEqual(samples?.map(\.bpm), [60, 61])
+    func testHRVLogUsesThirtyMinuteSlots() {
+        var parser = QCBand.SlotLogParser(kind: .hrv)
+        _ = parser.feed(QCBand.packet(0x39, [0x00, 0x02]))
+        let samples = parser.feed(QCBand.packet(0x39, [0x01, 0x00, 40, 0, 55]))
+        XCTAssertEqual(samples, [QCBand.DaySample(minuteOfDay: 0, value: 40),
+                                 QCBand.DaySample(minuteOfDay: 60, value: 55)])
     }
 
-    func testHeartRateLogNoData() {
-        var parser = QCBand.HeartRateLogParser()
-        XCTAssertEqual(parser.feed(QCBand.packet(0x15, [0xFF]), now: 0)?.count, 0)
+    func testSlotLogNoData() {
+        var parser = QCBand.SlotLogParser(kind: .heartRate)
+        XCTAssertEqual(parser.feed(QCBand.packet(0x15, [0xFF]))?.count, 0)
     }
 
     func testHeartRateLogHeaderExampleChecksum() {
         // colmi_r02_client example header bytes, checksum included.
         XCTAssertEqual(QCBand.packet(0x15, [0x00, 0x18, 0x05]), Self.hex("15001805000000000000000000000032"))
+    }
+
+    // MARK: - Steps
+
+    func testStepsBucket() {
+        var parser = QCBand.StepsParser()
+        XCTAssertNil(parser.feed(Self.hex("43f00501000000000000000000000039")))
+        // colmi_r02_client example: 2023-08-13, quarter 16, 200 kcal-units, 48 steps, 27 m. Last of 1.
+        let out = parser.feed(QCBand.packet(0x43, [0x23, 0x08, 0x13, 0x10, 0x00, 0x01, 0xC8, 0x00, 0x30, 0x00, 0x1B, 0x00]))
+        XCTAssertEqual(out, [QCBand.StepBucket(year: 2023, month: 8, day: 13, quarter: 16,
+                                               steps: 48, calories: 200, distanceM: 27)])
+        XCTAssertEqual(out?.first?.dayString, "2023-08-13")
+    }
+
+    // MARK: - Big data
+
+    func testBigDataAssemblyAcrossNotifications() {
+        var a = QCBand.BigDataAssembler()
+        XCTAssertNil(a.feed([0xBC, 0x27, 0x04, 0x00, 0x00, 0x00, 0x01]))
+        XCTAssertEqual(a.feed([0x02, 0x03, 0x04, 0x99]), [0xBC, 0x27, 0x04, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04])
+    }
+
+    func testParseSleep() {
+        // 1 night, today: 23:00 (1380) → 07:00 (420); light 120, deep 60, awake 10.
+        let body: [UInt8] = [0x01, 0x00, 10, 0x64, 0x05, 0xA4, 0x01, 2, 120, 3, 60, 5, 10]
+        let reply: [UInt8] = [0xBC, 0x27, UInt8(body.count), 0x00, 0x00, 0x00] + body
+        let nights = QCBand.parseSleep(reply)
+        XCTAssertEqual(nights.count, 1)
+        XCTAssertEqual(nights.first?.startMinute, 1_380)
+        XCTAssertEqual(nights.first?.endMinute, 420)
+        XCTAssertEqual(nights.first?.minutes(.light), 120)
+        XCTAssertEqual(nights.first?.minutes(.deep), 60)
+        XCTAssertEqual(nights.first?.minutes(.awake), 10)
+    }
+
+    func testParseSpO2() {
+        var day: [UInt8] = [0x00]
+        for h in 0..<24 { day += h == 3 ? [95, 98] : [0, 0] }
+        let reply: [UInt8] = [0xBC, 0x2A, UInt8(day.count), 0x00, 0x00, 0x00] + day
+        XCTAssertEqual(QCBand.parseSpO2(reply), [QCBand.SpO2Hour(daysAgo: 0, hour: 3, percent: 97)])
     }
 }
