@@ -19,6 +19,12 @@ public final class BLEManager: NSObject, ObservableObject {
     static let heartRateChar    = CBUUID(string: "2A37") // HR + R-R (works unbonded)
     static let batteryService   = CBUUID(string: "180F")
     static let batteryChar      = CBUUID(string: "2A19")
+    // QC Wireless band (QWatch Pro / Colmi protocol) — a non-WHOOP alternative; see QCBand.
+    static let qcService           = CBUUID(string: QCBand.serviceUUIDString)
+    static let qcRXChar            = CBUUID(string: QCBand.rxCharUUIDString)   // app → band
+    static let qcTXChar            = CBUUID(string: QCBand.txCharUUIDString)   // band → app
+    static let qcAdvertisedService = CBUUID(string: QCBand.advertisedServiceUUIDString)
+    static let discoveredServices = [customService, heartRateService, batteryService, qcService]
 
     static let restoreID = "com.openwhoop.ble.central"
 
@@ -97,6 +103,17 @@ public final class BLEManager: NSObject, ObservableObject {
     private var clockRequested = false
     private var intentionalDisconnect = false
 
+    // MARK: QC Wireless band
+    /// Set once the band's RX characteristic is found; non-nil means "this link is a QC band".
+    private var qcRX: CBCharacteristic?
+    private var isQCBand: Bool { qcRX != nil }
+    private var qcLog = QCBand.HeartRateLogParser()
+    /// UTC day starts whose heart-rate log is still to be requested (one log reply at a time).
+    private var qcLogQueue: [Int] = []
+    private var qcLogRequestedAt: Date?
+    /// Peripherals that advertised FEE7 but turned out to be neither a WHOOP strap nor a QC band.
+    private var ignoredPeripherals: Set<UUID> = []
+
     /// Stable device id; matches the server's existing device for sync parity. Overridable.
     let deviceId: String
     /// Captured (device↔wall) correlation from GET_CLOCK; nil until the response lands.
@@ -161,9 +178,11 @@ public final class BLEManager: NSObject, ObservableObject {
             log("Bluetooth not powered on (state=\(central.state.rawValue)); cannot scan yet")
             return
         }
-        log("Scanning for service \(BLEManager.customService)…")
+        log("Scanning for service \(BLEManager.customService) or a QC band (\(BLEManager.qcAdvertisedService))…")
+        // The QC band advertises only FEE7, not its 6E40FFF0 data service; didDiscoverServices
+        // confirms which kind of device this is and ignores FEE7 devices that are neither.
         central.scanForPeripherals(
-            withServices: [BLEManager.customService],
+            withServices: [BLEManager.customService, BLEManager.qcAdvertisedService],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
     }
@@ -383,9 +402,15 @@ public final class BLEManager: NSObject, ObservableObject {
     // MARK: - Keep-alive (always-ping + liveness watchdog)
 
     /// Enable the heavy realtime stream (type-40/43) and remember we want it re-armed by keep-alive.
-    public func startRealtime() { wantsRealtime = true; send(.toggleRealtimeHR, payload: [0x01]) }
+    public func startRealtime() {
+        wantsRealtime = true
+        if isQCBand { sendQC(QCBand.startRealtime()) } else { send(.toggleRealtimeHR, payload: [0x01]) }
+    }
     /// Stop the realtime stream. The lightweight 0x2A37 HR keeps recording continuously regardless.
-    public func stopRealtime() { wantsRealtime = false; send(.toggleRealtimeHR, payload: [0x00]) }
+    public func stopRealtime() {
+        wantsRealtime = false
+        if isQCBand { sendQC(QCBand.stopRealtime()) } else { send(.toggleRealtimeHR, payload: [0x00]) }
+    }
 
     private func startKeepAlive() {
         keepAliveTimer?.cancel()
@@ -406,6 +431,7 @@ public final class BLEManager: NSObject, ObservableObject {
             if let p = peripheral { central.cancelPeripheralConnection(p) }
             return
         }
+        if isQCBand { qcKeepAlive(); return }
         guard !backfilling else { return }            // never poke the strap mid-offload
         if wantsRealtime { send(.toggleRealtimeHR, payload: [0x01]) }   // re-arm so it can't lapse
         keepAliveTick += 1
@@ -508,6 +534,95 @@ public final class BLEManager: NSObject, ObservableObject {
         log("Alarm: test buzz fired (patternId=2, runAlarm)")
     }
 
+    // MARK: QC Wireless band
+
+    private func sendQC(_ packet: [UInt8]) {
+        guard let p = peripheral, let rx = qcRX else {
+            log("QC send ignored — not connected")
+            return
+        }
+        p.writeValue(Data(packet), for: rx, type: .withoutResponse)
+        log("→ QC \(hex(packet))")
+    }
+
+    /// Runs once the band's TX notifications are on: set its clock (UTC), read battery, make sure
+    /// it logs heart rate every 5 min on its own, then pull yesterday's and today's logs.
+    private func qcHandshake() {
+        guard !connectHandshakeDone else { return }
+        connectHandshakeDone = true
+        didBond = true
+        state.bonded = true
+        log("QC band ready — syncing clock and heart-rate log")
+        sendQC(QCBand.setTime(Date()))
+        sendQC(QCBand.batteryRequest())
+        sendQC(QCBand.enableHeartRateLog(intervalMinutes: 5))
+        let today = QCBand.utcDayStart(Int(Date().timeIntervalSince1970))
+        requestQCLogs([today - 86_400, today])
+        if wantsRealtime { sendQC(QCBand.startRealtime()) }
+        startKeepAlive()
+    }
+
+    /// Every keep-alive tick: battery (its reply also feeds the liveness watchdog), keep a
+    /// realtime session alive, and re-pull today's log every ~15 min.
+    private func qcKeepAlive() {
+        keepAliveTick += 1
+        sendQC(QCBand.batteryRequest())
+        if wantsRealtime { sendQC(QCBand.continueRealtime()) }
+        if keepAliveTick % (BLEManager.backfillIntervalSeconds / BLEManager.keepAliveIntervalSeconds) == 0 {
+            requestQCLogs([QCBand.utcDayStart(Int(Date().timeIntervalSince1970))])
+        }
+    }
+
+    private func requestQCLogs(_ days: [Int]) {
+        for d in days where !qcLogQueue.contains(d) { qcLogQueue.append(d) }
+        // One log at a time; a request with no reply for 30 s is abandoned.
+        if let at = qcLogRequestedAt, Date().timeIntervalSince(at) < 30 { return }
+        sendNextQCLogRequest()
+    }
+
+    private func sendNextQCLogRequest() {
+        guard !qcLogQueue.isEmpty else {
+            qcLogRequestedAt = nil
+            return
+        }
+        qcLogRequestedAt = Date()
+        qcLog = QCBand.HeartRateLogParser()
+        sendQC(QCBand.readHeartRateLog(dayStartUnix: qcLogQueue.removeFirst()))
+    }
+
+    private func handleQC(_ bytes: [UInt8]) {
+        guard let reply = QCBand.parse(bytes) else {
+            log("QC: unparsed \(hex(bytes))")
+            return
+        }
+        let now = Int(Date().timeIntervalSince1970)
+        switch reply {
+        case let .battery(pct, _):
+            state.setBattery(Double(pct))
+        case let .realtime(kind, bpm) where kind == QCBand.RealtimeKind.heartRate.rawValue:
+            guard bpm > 0 else { return }   // 0 = still measuring
+            if bpm >= 30 && bpm <= 220 { state.heartRate = bpm }
+            // No R-R from this band: HR only.
+            collector?.ingestStandardHR(hr: bpm, rr: [], at: now)
+        case let .realtimeError(kind, code):
+            log("QC: realtime kind \(kind) error \(code) (band not worn snugly?)")
+        case .notification(kind: 0x01):     // band logged a new heart-rate sample
+            requestQCLogs([QCBand.utcDayStart(now)])
+        case .heartRateLogPart:
+            guard let samples = qcLog.feed(bytes, now: now) else { return }
+            for s in samples { collector?.ingestStandardHR(hr: s.bpm, rr: [], at: s.ts) }
+            Task { @MainActor in await collector?.flushStandardHR() }
+            log("QC: heart-rate log — \(samples.count) samples")
+            if qcLogQueue.isEmpty {
+                state.lastSyncedAt = Date().timeIntervalSince1970
+                UserDefaults.standard.set(state.lastSyncedAt, forKey: "lastSyncedAt")
+            }
+            sendNextQCLogRequest()
+        default:
+            break
+        }
+    }
+
     /// Parse a standard BLE Heart Rate Measurement (0x2A37) via the pure StandardHeartRate parser.
     private func parseStandardHR(_ data: [UInt8]) {
         guard let m = StandardHeartRate.parse(data) else { return }
@@ -535,9 +650,7 @@ extension BLEManager: CBCentralManagerDelegate {
             if p.state != .connected {
                 central.connect(p, options: nil)
             } else {
-                p.discoverServices([
-                    BLEManager.customService, BLEManager.heartRateService, BLEManager.batteryService,
-                ])
+                p.discoverServices(BLEManager.discoveredServices)
             }
         } else {
             connect()
@@ -548,6 +661,7 @@ extension BLEManager: CBCentralManagerDelegate {
                                didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any],
                                rssi RSSI: NSNumber) {
+        guard !ignoredPeripherals.contains(peripheral.identifier) else { return }
         let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? "unknown"
         log("Discovered \(name) (rssi \(RSSI)) — connecting")
         central.stopScan()
@@ -560,9 +674,7 @@ extension BLEManager: CBCentralManagerDelegate {
         restoredPeripheral = nil
         state.connected = true
         log("Connected — discovering services")
-        peripheral.discoverServices([
-            BLEManager.customService, BLEManager.heartRateService, BLEManager.batteryService,
-        ])
+        peripheral.discoverServices(BLEManager.discoveredServices)
     }
 
     public func centralManager(_ central: CBCentralManager,
@@ -586,6 +698,10 @@ extension BLEManager: CBCentralManagerDelegate {
         backfillTimer = nil
         keepAliveTimer?.cancel()
         keepAliveTimer = nil
+        qcRX = nil
+        qcLog = QCBand.HeartRateLogParser()
+        qcLogQueue.removeAll()
+        qcLogRequestedAt = nil
         Task { @MainActor in await collector?.flushStandardHR() }   // persist any buffered 0x2A37 HR
         if !intentionalDisconnect {
             log("Disconnected\(error.map { " — \($0.localizedDescription)" } ?? ""); rescanning in 3s")
@@ -630,9 +746,7 @@ extension BLEManager: CBCentralManagerDelegate {
         if p.state == .connected {
             state.connected = true
             log("Restored CONNECTED peripheral \(p.identifier) — re-discovering services")
-            p.discoverServices([
-                BLEManager.customService, BLEManager.heartRateService, BLEManager.batteryService,
-            ])
+            p.discoverServices(BLEManager.discoveredServices)
         } else {
             state.connected = false
             log("Restored DISCONNECTED peripheral \(p.identifier) — reconnect on poweredOn")
@@ -645,6 +759,13 @@ extension BLEManager: CBCentralManagerDelegate {
 extension BLEManager: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let services = peripheral.services else { return }
+        let uuids = services.map(\.uuid)
+        if !uuids.contains(BLEManager.customService) && !uuids.contains(BLEManager.qcService) {
+            log("Not a WHOOP strap or QC band — ignoring \(peripheral.identifier)")
+            ignoredPeripherals.insert(peripheral.identifier)
+            central.cancelPeripheralConnection(peripheral)   // didDisconnect rescans
+            return
+        }
         for s in services {
             switch s.uuid {
             case BLEManager.customService:
@@ -655,6 +776,8 @@ extension BLEManager: CBPeripheralDelegate {
                 peripheral.discoverCharacteristics([BLEManager.heartRateChar], for: s)
             case BLEManager.batteryService:
                 peripheral.discoverCharacteristics([BLEManager.batteryChar], for: s)
+            case BLEManager.qcService:
+                peripheral.discoverCharacteristics([BLEManager.qcRXChar, BLEManager.qcTXChar], for: s)
             default: break
             }
         }
@@ -678,9 +801,12 @@ extension BLEManager: CBPeripheralDelegate {
                  BLEManager.eventNotifyChar,
                  BLEManager.dataNotifyChar,
                  BLEManager.heartRateChar,
-                 BLEManager.batteryChar:
+                 BLEManager.batteryChar,
+                 BLEManager.qcTXChar:
                 peripheral.setNotifyValue(true, for: c)
                 log("Subscribed \(c.uuid)")
+            case BLEManager.qcRXChar:
+                qcRX = c
             default: break
             }
         }
@@ -694,6 +820,8 @@ extension BLEManager: CBPeripheralDelegate {
             log("Confirmed write failed: \(error.localizedDescription)")
             return
         }
+        // Only the WHOOP command channel drives the bond + connect handshake below.
+        guard characteristic.uuid == BLEManager.cmdWriteChar else { return }
         if !didBond {
             didBond = true
             state.bonded = true
@@ -768,6 +896,8 @@ extension BLEManager: CBPeripheralDelegate {
             parseStandardHR(bytes)
         case BLEManager.batteryChar:
             if let pct = bytes.first { state.setBattery(Double(pct)) } // 0x2A19 = percent
+        case BLEManager.qcTXChar:
+            handleQC(bytes)
         case BLEManager.dataNotifyChar,
              BLEManager.cmdNotifyChar,
              BLEManager.eventNotifyChar:
@@ -822,6 +952,8 @@ extension BLEManager: CBPeripheralDelegate {
                            error: Error?) {
         if let error = error {
             log("Notify enable failed for \(characteristic.uuid): \(error.localizedDescription)")
+            return
         }
+        if characteristic.uuid == BLEManager.qcTXChar, characteristic.isNotifying { qcHandshake() }
     }
 }
